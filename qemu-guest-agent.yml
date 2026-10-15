@@ -1,0 +1,182 @@
+# Ubuntu/Debian guests. Runs serially; never force-stops a VM.
+# Proxmox SSH uses local SSH config/agent. Run with -e @proxmox-map.yml.
+# node_name enables k3s server readiness checks; omit for other VMs.
+---
+- name: Validate guest-agent inventory before powering down any VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+  - name: Require a nonempty Proxmox mapping
+    ansible.builtin.assert:
+      that:
+      - proxmox_map is defined
+      - (proxmox_map | default({}) | length) > 0
+      fail_msg: Supply proxmox_map with inventory hostnames, Proxmox SSH targets, VMIDs, and Proxmox VM names. Add
+        node_name only for k3s server VMs.
+  - name: Check each mapping
+    ansible.builtin.assert:
+      that:
+      - item.key in groups['guest_agent_vms']
+      - item.value.vmid | int > 0
+      - item.value.ssh_target | length > 0
+      - item.value.vm_name | length > 0
+    loop: '{{ proxmox_map | dict2items }}'
+  - name: Verify Proxmox SSH access and VM identity
+    ansible.builtin.command:
+      argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - '{{ item.value.ssh_target }}'
+      - qm
+      - config
+      - '{{ item.value.vmid | string }}'
+    loop: '{{ proxmox_map | dict2items }}'
+    register: vm_configs
+    changed_when: false
+  - name: Confirm VM names match the intended Kubernetes nodes
+    ansible.builtin.assert:
+      that:
+      - '(''name: '' ~ item.item.value.vm_name) in item.stdout_lines'
+      fail_msg: VM name does not match expected node. Correct the mapping before proceeding.
+    loop: '{{ vm_configs.results }}'
+    loop_control:
+      label: '{{ item.item.key }}'
+- name: Install guest agent and power cycle one VM at a time
+  hosts: guest_agent_vms
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    target: '{{ proxmox_map[inventory_hostname] }}'
+    k3s_node_names: '{{ proxmox_map.values() | selectattr(''node_name'', ''defined'') | map(attribute=''node_name'')
+      | list }}'
+  tasks:
+  - name: Require mapping and supported guest OS
+    ansible.builtin.assert:
+      that:
+      - inventory_hostname in proxmox_map
+      - ansible_facts.os_family == 'Debian'
+  - name: Wait for mapped k3s nodes to be Ready before a k3s shutdown
+    ansible.builtin.command:
+      argv: '{{ [''kubectl'', ''wait'', ''--for=condition=Ready'', ''node''] + k3s_node_names + [''--timeout=300s'']
+        }}'
+    delegate_to: localhost
+    become: false
+    changed_when: false
+    when:
+    - target.node_name is defined
+    - not ansible_check_mode
+  - name: Install QEMU guest agent
+    ansible.builtin.apt:
+      name: qemu-guest-agent
+      state: present
+      update_cache: true
+      cache_valid_time: 3600
+  - name: Enable guest-agent channel in Proxmox VM configuration
+    ansible.builtin.command:
+      argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - '{{ target.ssh_target }}'
+      - qm
+      - set
+      - '{{ target.vmid | string }}'
+      - --agent
+      - enabled=1
+    delegate_to: localhost
+    become: false
+  - name: Gracefully power off guest after allowing task response
+    ansible.builtin.shell: sleep 3; systemctl poweroff
+    async: 15
+    poll: 0
+    when: not ansible_check_mode
+  - name: Wait until Proxmox confirms VM is stopped
+    ansible.builtin.command:
+      argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - '{{ target.ssh_target }}'
+      - qm
+      - status
+      - '{{ target.vmid | string }}'
+    register: vm_status
+    until: '''status: stopped'' in vm_status.stdout'
+    retries: 60
+    delay: 5
+    delegate_to: localhost
+    become: false
+    changed_when: false
+    when: not ansible_check_mode
+  - name: Start VM through Proxmox
+    ansible.builtin.command:
+      argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - '{{ target.ssh_target }}'
+      - qm
+      - start
+      - '{{ target.vmid | string }}'
+    delegate_to: localhost
+    become: false
+    when: not ansible_check_mode
+  - name: Wait for guest SSH to return
+    ansible.builtin.wait_for_connection:
+      delay: 5
+      timeout: 300
+    when: not ansible_check_mode
+  - name: Start guest agent with channel now available
+    ansible.builtin.systemd_service:
+      name: qemu-guest-agent
+      state: started
+    when: not ansible_check_mode
+  - name: Verify Proxmox can contact the guest agent
+    ansible.builtin.command:
+      argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - '{{ target.ssh_target }}'
+      - qm
+      - agent
+      - '{{ target.vmid | string }}'
+      - ping
+    register: agent_ping
+    until: agent_ping.rc == 0
+    retries: 12
+    delay: 5
+    delegate_to: localhost
+    become: false
+    changed_when: false
+    when: not ansible_check_mode
+  - name: Wait for local k3s API and etcd readiness
+    ansible.builtin.command: k3s kubectl get --raw=/readyz
+    register: k3s_ready
+    until: k3s_ready.rc == 0 and k3s_ready.stdout | trim == 'ok'
+    retries: 60
+    delay: 5
+    changed_when: false
+    when:
+    - target.node_name is defined
+    - not ansible_check_mode
+  - name: Wait for Kubernetes node readiness before proceeding
+    ansible.builtin.command:
+      argv:
+      - kubectl
+      - wait
+      - --for=condition=Ready
+      - node
+      - '{{ target.node_name }}'
+      - --timeout=300s
+    delegate_to: localhost
+    become: false
+    changed_when: false
+    when:
+    - target.node_name is defined
+    - not ansible_check_mode
